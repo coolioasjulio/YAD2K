@@ -1,44 +1,21 @@
 """
 This is a script that can be used to retrain the YOLOv2 model for your own dataset.
 """
-import argparse
 
 import os
 import random
-import matplotlib.pyplot as plt
 import numpy as np
 import PIL
 import tensorflow as tf
+from matplotlib import pyplot as plt
 from keras import backend as K
 from keras.layers import Input, Lambda, Conv2D
 from keras.models import load_model, Model
 from keras.callbacks import TensorBoard, ModelCheckpoint, EarlyStopping
-
+import playground
 from yad2k.models.keras_yolo import (preprocess_true_boxes, yolo_body,
                                      yolo_eval, yolo_head, yolo_loss)
 from yad2k.utils.draw_boxes import draw_boxes
-
-# Args
-argparser = argparse.ArgumentParser(
-    description="Retrain or 'fine-tune' a pretrained YOLOv2 model for your own data.")
-
-argparser.add_argument(
-    '-d',
-    '--data_path',
-    help="path to numpy data file (.npz) containing np.object array 'boxes' and np.uint8 array 'images'",
-    default=os.path.join('..', 'DATA', 'underwater_data.npz'))
-
-argparser.add_argument(
-    '-a',
-    '--anchors_path',
-    help='path to anchors file, defaults to yolo_anchors.txt',
-    default=os.path.join('model_data', 'yolo_anchors.txt'))
-
-argparser.add_argument(
-    '-c',
-    '--classes_path',
-    help='path to classes file, defaults to pascal_classes.txt',
-    default=os.path.join('..', 'DATA', 'underwater_classes.txt'))
 
 # Default anchor boxes
 YOLO_ANCHORS = np.array(
@@ -64,11 +41,10 @@ def _main():
     anchors = YOLO_ANCHORS
 
     detectors_mask, matching_true_boxes = get_detector_mask(boxes, anchors)
-    
-    train_images, train_boxes, val_images, val_boxes = train_val_split(image_data, boxes)
 
     model_body, model = create_model(anchors, class_names)
-    print('starting training!')
+    """
+    print('Starting training!')
     train_gen(
         model,
         class_names,
@@ -79,14 +55,15 @@ def _main():
         matching_true_boxes
     )
     """
-    draw(model_body,
+    from datetime import datetime
+    start = datetime.now()
+    draw_random(model_body,
         class_names,
         anchors,
-        image_data,
-        image_set='val', # assumes training/validation split is 0.9
-        weights_name='trained_stage_3_best.h5',
-        save_all=False)
-    """
+        generator(image_data,boxes,detectors_mask,matching_true_boxes, batch_size=1))
+    end = datetime.now()
+    elapsed = end - start
+    print('Finished with {} seconds elapsed!'.format(elapsed.total_seconds()))
 
 def get_classes(classes_path):
     '''loads the classes'''
@@ -105,24 +82,6 @@ def get_anchors(anchors_path):
     else:
         Warning("Could not open anchors file, using default.")
         return YOLO_ANCHORS
-    
-def train_val_split(images, boxes, val_split=0.1):
-    train_len = round(images.shape[0] * (1.-val_split))
-    val_len = images.shape[0] - train_len
-    train_images = np.empty((train_len,)+images.shape[1:])
-    train_boxes = np.empty((train_len,)+boxes.shape[1:])
-    val_images = np.empty((val_len,)+images.shape[1:])
-    val_boxes = np.empty((val_len,)+images.shape[1:])
-    
-    indices = [i for i in range(0, images.shape[0])]
-    random.shuffle(indices)
-    for i,index in enumerate(indices[:train_len]):
-        train_images[i] = images[index]
-        train_boxes[i] = images[index]
-    for i,index in enumerate(indices[train_len:]):
-        val_images[i] = images[index]
-        val_boxes[i] = boxes[index]
-    return train_images, train_boxes, val_images, val_boxes
 
 def process_boxes(images, boxes):
     orig_size = np.array([images.shape[1], images.shape[2]])
@@ -246,6 +205,36 @@ def create_model(anchors, class_names, load_pretrained=True, freeze_body=True):
          matching_boxes_input], model_loss)
 
     return model_body, model
+    
+def train_val_split(images, boxes, masks, matches, val_split=0.1):
+    train_len = round(images.shape[0] * (1.-val_split))
+    val_len = images.shape[0] - train_len
+    
+    train_images = np.empty((train_len,)+images.shape[1:], dtype=images.dtype)
+    train_boxes = np.empty((train_len,)+boxes.shape[1:], dtype=boxes.dtype)
+    train_masks = np.empty((train_len,)+masks.shape[1:], dtype=masks.dtype)
+    train_matches = np.empty((train_len,)+matches.shape[1:], dtype=matches.dtype)
+    
+    val_images = np.empty((val_len,)+images.shape[1:], dtype=images.dtype)
+    val_boxes = np.empty((val_len,)+boxes.shape[1:], dtype=boxes.dtype)
+    val_masks = np.empty((val_len,)+masks.shape[1:], dtype=masks.dtype)
+    val_matches = np.empty((val_len,)+matches.shape[1:], dtype=matches.dtype)
+    
+    indices = [i for i in range(0, images.shape[0])]
+    random.shuffle(indices)
+    for i,index in enumerate(indices[:train_len]):
+        train_images[i] = images[index]
+        train_boxes[i] = boxes[index]
+        train_masks[i] = masks[index]
+        train_matches[i] = matches[index]
+    for i,index in enumerate(indices[train_len:]):
+        val_images[i] = images[index]
+        val_boxes[i] = boxes[index]
+        val_masks[i] = masks[index]
+        val_matches[i] = matches[index]
+    train_data = (train_images, train_boxes, train_masks, train_matches)
+    val_data = (val_images, val_boxes, val_masks, val_matches)
+    return train_data, val_data
 
 def generator(image_data, boxes, detectors_mask, matching_true_boxes, batch_size=32):
     im_shape = (batch_size,) + image_data.shape[1:]
@@ -266,20 +255,28 @@ def generator(image_data, boxes, detectors_mask, matching_true_boxes, batch_size
         processed_images = process_images(image_batch)
         yield [processed_images, box_batch, mask_batch, match_batch], np.zeros((batch_size,1))
         
-def train_gen(model, class_names, anchors, image_data, boxes, detectors_mask, matching_true_boxes):
+def train_gen(model, class_names, anchors, image_data, boxes, detectors_mask, matching_true_boxes, val_split=0.1):
     model.compile(
         optimizer='adam', loss={
             'yolo_loss': lambda y_true, y_pred: y_pred
         })  # This is a hack to use the custom loss function in the last layer.
-
-
+    train_data, val_data = train_val_split(image_data, 
+                                           boxes, 
+                                           detectors_mask, 
+                                           matching_true_boxes, 
+                                           val_split=val_split)
+    train_len = round(len(image_data)*(1.-val_split))
+    val_len = len(image_data) - train_len
+    print('Created train-val split!')
     logging = TensorBoard()
     checkpoint = ModelCheckpoint("trained_stage_3_best.h5", monitor='val_loss',
                                  save_weights_only=True, save_best_only=True)
     early_stopping = EarlyStopping(monitor='val_loss', min_delta=0, patience=15, verbose=1, mode='auto')
     
-    model.fit_generator(generator=generator(image_data,boxes,detectors_mask,matching_true_boxes, batch_size=32),
-                        steps_per_epoch=len(image_data)//32,
+    model.fit_generator(generator=generator(*train_data, batch_size=32),
+                        steps_per_epoch=train_len//32,
+                        validation_data = generator(*val_data, batch_size=32),
+                        validation_steps = val_len//32,
                         epochs=5,
                         callbacks=[logging])
     model.save_weights('trained_stage_1.h5')
@@ -294,15 +291,19 @@ def train_gen(model, class_names, anchors, image_data, boxes, detectors_mask, ma
         })  # This is a hack to use the custom loss function in the last layer.
 
 
-    model.fit_generator(generator=generator(image_data,boxes,detectors_mask,matching_true_boxes, batch_size=8),
-                        steps_per_epoch=len(image_data)//8,
+    model.fit_generator(generator=generator(*train_data, batch_size=8),
+                        steps_per_epoch=train_len//8,
+                        validation_data = generator(*val_data, batch_size=8),
+                        validation_steps = val_len // 8,
                         epochs=30,
                         callbacks=[logging])
 
     model.save_weights('trained_stage_2.h5')
 
-    model.fit_generator(generator=generator(image_data,boxes,detectors_mask,matching_true_boxes, batch_size=8),
-                        steps_per_epoch=len(image_data)//8,
+    model.fit_generator(generator=generator(*train_data, batch_size=8),
+                        steps_per_epoch=train_len//8,
+                        validation_data = generator(*val_data, batch_size=8),
+                        validation_steps = val_len // 8,
                         epochs=30,
                         callbacks=[logging, checkpoint, early_stopping])
 
@@ -364,23 +365,17 @@ def train(model, class_names, anchors, image_data, boxes, detectors_mask, matchi
               callbacks=[logging, checkpoint, early_stopping])
 
     model.save_weights('trained_stage_3.h5')
+    
+def draw_random(model_body, class_names, anchors, data_gen):
+    draw(model_body, class_names, anchors, data_gen.__next__()[0][0])
 
-def draw(model_body, class_names, anchors, image_data, image_set='val',
-            weights_name='trained_stage_3_best.h5', out_path="output_images", save_all=True):
+def draw(model_body, class_names, anchors, image_data, weights_name='trained_stage_3_best.h5'):
     '''
     Draw bounding boxes on image data
     '''
-    if image_set == 'train':
-        image_data = np.array([np.expand_dims(image, axis=0)
-            for image in image_data[:int(len(image_data)*.9)]])
-    elif image_set == 'val':
-        image_data = np.array([np.expand_dims(image, axis=0)
-            for image in image_data[int(len(image_data)*.9):]])
-    elif image_set == 'all':
-        image_data = np.array([np.expand_dims(image, axis=0)
-            for image in image_data])
-    else:
-        ValueError("draw argument image_set must be 'train', 'val', or 'all'")
+    image_data = np.array([np.expand_dims(image, axis=0)
+        for image in image_data])
+    
     # model.load_weights(weights_name)
     print(image_data.shape)
     model_body.load_weights(weights_name)
@@ -389,13 +384,11 @@ def draw(model_body, class_names, anchors, image_data, image_set='val',
     yolo_outputs = yolo_head(model_body.output, anchors, len(class_names))
     input_image_shape = K.placeholder(shape=(2, ))
     boxes, scores, classes = yolo_eval(
-        yolo_outputs, input_image_shape, score_threshold=0.07, iou_threshold=0)
+        yolo_outputs, input_image_shape, score_threshold=0.3, iou_threshold=0)
 
     # Run prediction on overfit image.
     sess = K.get_session()  # TODO: Remove dependence on Tensorflow session.
-
-    if  not os.path.exists(out_path):
-        os.makedirs(out_path)
+    
     for i in range(len(image_data)):
         out_boxes, out_scores, out_classes = sess.run(
             [boxes, scores, classes],
@@ -410,14 +403,9 @@ def draw(model_body, class_names, anchors, image_data, image_set='val',
         # Plot image with predicted boxes.
         image_with_boxes = draw_boxes(image_data[i][0], out_boxes, out_classes,
                                     class_names, out_scores)
-        # Save the image:
-        if save_all or (len(out_boxes) > 0):
-            image = PIL.Image.fromarray(image_with_boxes)
-            image.save(os.path.join(out_path,str(i)+'.png'))
-
         # To display (pauses the program):
-        # plt.imshow(image_with_boxes, interpolation='nearest')
-        # plt.show()
+        plt.imshow(image_with_boxes, interpolation='nearest')
+        plt.show()
 
 
 
